@@ -1,0 +1,155 @@
+// Shared helpers for Glam's Inner Circle loyalty functions.
+//
+// Storage model: EVENT SOURCING. Every point change is its own immutable blob:
+//   ev:<email>:<kind>:<unique-id>  -> { email, points, date, label, kind }
+//   claim:<CODE>                  -> { email, rewardId, rewardName, cost, status, createdAt }
+//
+// Reads aggregate a member's events. Writes never read-modify-write shared
+// state, so concurrent writes can't clobber each other.
+import { getStore } from "@netlify/blobs";
+
+export const VIP_THRESHOLD = 300;
+
+export const REWARDS = [
+  { id: "discount20", name: "20% off anything", cost: 50, blurb: "A personal 20%-off code for the shop." },
+  { id: "free7", name: "Free $7 product — your pick", cost: 100, blurb: "Any $7 product, on the house." },
+  { id: "free27", name: "Free $27 product — your pick", cost: 200, blurb: "Any $27 product, on the house." },
+];
+
+export const ALLOWED_ORIGINS = new Set([
+  "https://nakeymasi-coder.github.io",
+  "https://workshop-poratl.netlify.app",
+  "https://deploy-preview-2--workshop-poratl.netlify.app",
+]);
+
+export function corsHeaders(req) {
+  const origin = req.headers.get("Origin");
+  return {
+    "Content-Type": "application/json",
+    Vary: "Origin",
+    ...(origin && ALLOWED_ORIGINS.has(origin)
+      ? { "Access-Control-Allow-Origin": origin }
+      : {}),
+  };
+}
+
+export function json(data, status, req) {
+  return new Response(JSON.stringify(data), { status, headers: corsHeaders(req) });
+}
+
+export async function withCors(req, handler) {
+  const origin = req.headers.get("Origin");
+  const headers = corsHeaders(req);
+  if (origin && !ALLOWED_ORIGINS.has(origin)) {
+    return new Response(JSON.stringify({ success: false, message: "This origin is not allowed." }), { status: 403, headers });
+  }
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: { ...headers, "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" },
+    });
+  }
+  if (req.method !== "POST") {
+    return new Response(JSON.stringify({ success: false, message: "Use POST." }), { status: 405, headers });
+  }
+  try {
+    return await handler(req);
+  } catch (error) {
+    console.error("inner-circle error:", error);
+    return new Response(JSON.stringify({ success: false, message: "Something went wrong. Please try again." }), { status: 500, headers });
+  }
+}
+
+export function memberStore() {
+  return getStore("inner-circle");
+}
+
+export function eventKey(email, kind, id) {
+  return `ev:${email.trim().toLowerCase()}:${kind}:${id}`;
+}
+
+export function claimKey(code) {
+  return `claim:${code}`;
+}
+
+export function newEventId() {
+  return `${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+}
+
+export function isValidEmail(email) {
+  return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email.trim());
+}
+
+export function tierFor(lifetime) {
+  return lifetime >= VIP_THRESHOLD ? "vip" : "member";
+}
+
+// All of a member's point events, oldest first.
+export async function getMemberEvents(store, email) {
+  email = email.trim().toLowerCase();
+  const listed = await store.list({ prefix: `ev:${email}:` }).catch(() => ({ blobs: [] }));
+  const events = [];
+  for (const b of listed.blobs || []) {
+    const e = await store.get(b.key, { type: "json" }).catch(() => null);
+    if (e && typeof e.points === "number") events.push(e);
+  }
+  events.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return events;
+}
+
+// Fold events into balance/lifetime/tier/activity.
+export function summarize(events) {
+  let points = 0;
+  let lifetime = 0;
+  const activity = [];
+  for (const e of events) {
+    const p = Math.floor(Number(e.points) || 0);
+    points += p;
+    if (p > 0) lifetime += p;
+    activity.push({ date: e.date || "", label: e.label || "", points: p });
+  }
+  points = Math.max(0, points);
+  return {
+    points,
+    lifetime,
+    tier: tierFor(lifetime),
+    joined: events.length ? events[0].date || "" : "",
+    activity: activity.slice(-60),
+  };
+}
+
+// All pending claim blobs.
+export async function listPendingClaims(store) {
+  const listed = await store.list({ prefix: "claim:" }).catch(() => ({ blobs: [] }));
+  const claims = [];
+  for (const b of listed.blobs || []) {
+    const c = await store.get(b.key, { type: "json" }).catch(() => null);
+    if (c && c.status === "pending") {
+      claims.push({ code: b.key.split(":")[1], ...c });
+    }
+  }
+  claims.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+  return claims;
+}
+
+// Very light per-IP rate limit (best effort, in-memory).
+const hits = new Map();
+export function rateLimited(req, maxPerMinute = 40) {
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  const now = Date.now();
+  const arr = (hits.get(ip) || []).filter((t) => now - t < 60000);
+  arr.push(now);
+  hits.set(ip, arr);
+  return arr.length > maxPerMinute;
+}
+
+export function claimCode() {
+  const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let s = "";
+  for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return `GLAM-${s}`;
+}
+
+export function todayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
